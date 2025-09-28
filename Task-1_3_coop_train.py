@@ -206,7 +206,6 @@ def train_coop():
         print("Weights loaded successfully. Resuming training...")
     else:
         print("No existing weights found. Starting training from scratch.")
-    # --- MODIFICATION END ---
     
     # Training settings
     optimizer = optim.AdamW(prompt_learner.parameters(), lr=0.002)
@@ -318,23 +317,3 @@ if __name__ == "__main__":
     
     # Train CoOp
     coop_model, history = train_coop()
-    
-    # # --- INFERENCE AND EVALUATION ---
-    # print("\n" + "="*30)
-    # print("Running Inference and Evaluation")
-    # print("="*30)
-    
-    # model_weights_path = f'weights{os.sep}task_1_3_best_coop_model.pth'
-    
-    # if os.path.exists(model_weights_path):
-    #     metrics = evaluate_coop_model(model_weights_path)
-    #     # Save Results
-    #     with open(f"results{os.sep}task-1_3_coop.json", "w") as file:
-    #         file.write(json.dumps({
-    #             "Top-1 Accuracy": f"{metrics['accuracy']:.4f}", \
-    #             "F1-Score": f"{metrics['f1_score']:.4f}", \
-    #             "AUC-ROC": f"{metrics['auc_roc']:.4f}"
-    #         }))
-    # else:
-    #     print(f"Model weights not found at '{model_weights_path}'.")
-    #     print("Please train the model first by running the train_coop() function.")

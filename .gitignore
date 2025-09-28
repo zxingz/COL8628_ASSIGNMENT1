@@ -11,3 +11,8 @@ wheels/
 
 # Data folders
 data/
+weights/
+logs/
+checkpoints/
+
+*.pth
