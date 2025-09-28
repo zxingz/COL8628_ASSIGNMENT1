@@ -3,6 +3,7 @@ import os
 import json
 from collections import defaultdict
 from datetime import datetime
+import copy
 
 import clip
 
@@ -41,15 +42,17 @@ os.makedirs(weights_folder, exist_ok=True)
 os.makedirs(results_folder, exist_ok=True)
 
 
-def evaluate_metrics(y_true, y_pred, y_pred_proba):
-    """Calculates accuracy, F1-score, and AUC-ROC."""
+def evaluate_metrics(y_true, y_pred, y_pred_proba, label_encoder):
+    """
+    Calculates accuracy, F1-score, and AUC-ROC.
+    Accepts a pre-fitted label_encoder to ensure consistent class mapping.
+    """
     # Calculate metrics
     accuracy = accuracy_score(y_true, y_pred)
     f1 = f1_score(y_true, y_pred, average='weighted')
     
-    # Convert labels to numerical format for AUC-ROC
-    le = LabelEncoder()
-    y_true_encoded = le.fit_transform(y_true)
+    # Use the provided, globally-fitted label encoder to transform true labels
+    y_true_encoded = label_encoder.transform(y_true)
     
     # Calculate AUC-ROC
     auc_roc = roc_auc_score(y_true_encoded, y_pred_proba, multi_class='ovr')
@@ -81,181 +84,205 @@ class OrthonetDataset(Dataset):
         return image, label
 
 # =============================================================================
-# 3. CoOp Model Definitions (Original for Reference)
+# 3. MaPLe Model Definitions
 # =============================================================================
-class CoOpPromptLearner(nn.Module):
-    """Original CoOp prompt learner."""
-    def __init__(self, clip_model, n_ctx=16, n_cls=12, tokenized_prompts=None, ctx_init=""):
+class MaPLePromptLearner(nn.Module):
+    """
+    MaPLe Prompt Learner. Extends CoCoOp by adding deep, layer-specific prompts
+    for both the vision and text encoders.
+    """
+    def __init__(self, clip_model, n_cls=12, n_ctx=2, deep_n_ctx=2, num_deep_layers=3):
         super().__init__()
         
-        self.n_ctx = n_ctx
         self.n_cls = n_cls
+        self.n_ctx = n_ctx # Number of context tokens for input-level text prompt
+        self.deep_n_ctx = deep_n_ctx # Number of context tokens for deep prompts
+        self.num_deep_layers = num_deep_layers # Number of transformer layers to inject prompts
+
+        # --- FIX START ---
+        # Get the correct dimensions from the CLIP model
+        ctx_dim = clip_model.ln_final.weight.shape[0]              # Text feature dimension (512)
+        vis_transformer_dim = clip_model.visual.transformer.width  # Vision transformer dimension (768)
+        vis_output_dim = clip_model.visual.output_dim              # Vision final output dimension (512)
+        # --- FIX END ---
         
-        ctx_vectors = torch.empty(n_ctx, clip_model.ln_final.weight.shape[0])
+        # --- Input-level Text Prompt (similar to CoCoOp) ---
+        # Base learnable context vectors
+        ctx_vectors = torch.empty(n_ctx, ctx_dim, dtype=clip_model.dtype)
         nn.init.normal_(ctx_vectors, std=0.02)
         self.ctx = nn.Parameter(ctx_vectors)
         
-        with torch.no_grad():
-            embedding = clip_model.token_embedding(tokenized_prompts).type(self.ctx.dtype)
-        
-        self.register_buffer("token_prefix", embedding[:, :1, :]) # SOS token
-        self.register_buffer("token_suffix", embedding[:, 1 + n_ctx :, :]) # Class and EOS tokens
-        
-    def forward(self):
-        ctx = self.ctx
-        if ctx.dim() == 2:
-            ctx = ctx.unsqueeze(0).expand(self.n_cls, -1, -1)
-        
-        prefix = self.token_prefix
-        suffix = self.token_suffix
-        
-        prompts = torch.cat([prefix, ctx, suffix], dim=1)
-        return prompts
-
-class CoOpCLIP(nn.Module):
-    """Original CoOp wrapper around CLIP."""
-    def __init__(self, clip_model, prompt_learner, tokenized_prompts):
-        super().__init__()
-        self.clip_model = clip_model
-        self.prompt_learner = prompt_learner
-        self.register_buffer("tokenized_prompts", tokenized_prompts)
-        
-    def forward(self, image):
-        prompts = self.prompt_learner()
-        image_features = self.clip_model.encode_image(image)
-        
-        x = prompts + self.clip_model.positional_embedding
-        x = x.to(self.clip_model.dtype)
-        
-        x = x.permute(1, 0, 2)
-        x = self.clip_model.transformer(x)
-        x = x.permute(1, 0, 2)
-        x = self.clip_model.ln_final(x)
-
-        eot_indices = self.tokenized_prompts.argmax(dim=-1)
-        text_features = x[torch.arange(x.shape[0]), eot_indices] @ self.clip_model.text_projection
-        
-        image_features = image_features / image_features.norm(dim=-1, keepdim=True)
-        text_features = text_features / text_features.norm(dim=-1, keepdim=True)
-        
-        logits = image_features @ text_features.t()
-        return logits
-
-# =============================================================================
-# 4. CoCoOp Model Definitions (NEW IMPLEMENTATION)
-# =============================================================================
-class CoCoOpPromptLearner(nn.Module):
-    """
-    CoCoOp Prompt Learner. Conditions the prompt on image features.
-    """
-    def __init__(self, clip_model, n_ctx=16, n_cls=12, tokenized_prompts=None):
-        super().__init__()
-        
-        self.n_ctx = n_ctx
-        self.n_cls = n_cls
-        
-        clip_im_dim = clip_model.visual.output_dim
-        ctx_dim = clip_model.ln_final.weight.shape[0]
-
-        # Base learnable context vectors (like CoOp)
-        ctx_vectors = torch.empty(n_ctx, ctx_dim)
-        nn.init.normal_(ctx_vectors, std=0.02)
-        self.ctx = nn.Parameter(ctx_vectors) # self.ctx is float32 by default
-        
-        # Meta-network to generate instance-specific token from image features
+        # Meta-network for instance-specific conditioning
         self.meta_net = nn.Sequential(
-            nn.Linear(clip_im_dim, clip_im_dim // 16),
+            # --- FIX START ---
+            # The meta_net takes the FINAL 512-dim image features as input
+            nn.Linear(vis_output_dim, vis_output_dim // 16, dtype=clip_model.dtype),
+            # --- FIX END ---
             nn.ReLU(),
-            nn.Linear(clip_im_dim // 16, ctx_dim)
-        ) # self.meta_net weights are float32 by default
+            nn.Linear(vis_output_dim // 16, ctx_dim, dtype=clip_model.dtype)
+        )
         
-        # Pre-computed embeddings for prompt components
-        with torch.no_grad():
-            embedding = clip_model.token_embedding(tokenized_prompts).type(self.ctx.dtype)
+        # --- Deep Prompts (MaPLe's key addition) ---
+        # Learnable prompts for the first N layers of the text encoder
+        self.deep_text_prompts = nn.Parameter(
+            torch.empty(self.num_deep_layers, self.deep_n_ctx, ctx_dim, dtype=clip_model.dtype)
+        )
+        nn.init.normal_(self.deep_text_prompts, std=0.02)
         
-        self.register_buffer("token_prefix", embedding[:, :1, :])
-        self.register_buffer("token_suffix", embedding[:, 1 + n_ctx :, :])
+        # Learnable prompts for the first N layers of the vision encoder
+        self.deep_vision_prompts = nn.Parameter(
+            # --- FIX START ---
+            # Deep vision prompts must have the same dimension as the transformer blocks (768)
+            torch.empty(self.num_deep_layers, self.deep_n_ctx, vis_transformer_dim, dtype=clip_model.dtype)
+            # --- FIX END ---
+        )
+        nn.init.normal_(self.deep_vision_prompts, std=0.02)
 
     def forward(self, image_features):
         """
-        Generates dynamic prompts based on image features.
+        Generates the dynamic input-level prompt. Deep prompts are parameters
+        and are accessed directly by the main MaPLeCLIP model.
         """
-        # image_features are float16 from CLIP's encoder
+        # Generate the delta for the input-level text prompt
+        delta = self.meta_net(image_features)
         
-        # === FIX STARTS HERE ===
-        # Cast image_features to float32 to match the meta_net's weights.
-        # We use self.ctx.dtype as a robust way to get the target type (float32).
-        image_features_float32 = image_features.type(self.ctx.dtype)
-        delta = self.meta_net(image_features_float32) # shape: (batch_size, ctx_dim)
-        # === FIX ENDS HERE ===
-        
-        # Add delta to base context vectors
+        # Add delta to the base context vectors
         ctx_shifted = self.ctx.unsqueeze(0) + delta.unsqueeze(1)
         # Broadcasting: (1, n_ctx, dim) + (b, 1, dim) -> (b, n_ctx, dim)
         
-        b = image_features.shape[0]
-        c = self.n_cls
-        
-        # Expand components for batch-wise concatenation
-        prefix = self.token_prefix.unsqueeze(0).expand(b, -1, -1, -1)
-        suffix = self.token_suffix.unsqueeze(0).expand(b, -1, -1, -1)
-        ctx_shifted_expanded = ctx_shifted.unsqueeze(1).expand(-1, c, -1, -1)
-        
-        prompts = torch.cat([prefix, ctx_shifted_expanded, suffix], dim=2)
-        return prompts
+        return ctx_shifted
 
-class CoCoOpCLIP(nn.Module):
+class MaPLeCLIP(nn.Module):
     """
-    CoCoOp wrapper around CLIP, using the CoCoOpPromptLearner.
+    MaPLe wrapper around CLIP. Injects learnable prompts at multiple layers
+    of both the vision and text encoders.
     """
     def __init__(self, clip_model, prompt_learner, tokenized_prompts):
         super().__init__()
-        self.clip_model = clip_model
         self.prompt_learner = prompt_learner
-        self.register_buffer("tokenized_prompts", tokenized_prompts)
+        self.tokenized_prompts = tokenized_prompts
+        self.image_encoder = clip_model.visual
+        self.text_encoder = clip_model.transformer # The text transformer part
+        self.logit_scale = clip_model.logit_scale
+        self.dtype = clip_model.dtype
+
+        # Unpack text encoder components
+        self.token_embedding = clip_model.token_embedding
+        self.positional_embedding = clip_model.positional_embedding
+        self.ln_final = clip_model.ln_final
+        self.text_projection = clip_model.text_projection
         
     def forward(self, image):
-        # 1. Encode image. Output is likely float16.
-        image_features = self.clip_model.encode_image(image) # (b, feat_dim)
+        # ================== 1. Vision Forward Pass with Deep Prompts ==================
         
-        # 2. Generate dynamic prompts based on image features.
-        # The prompt_learner now handles the dtype conversion internally.
-        prompts = self.prompt_learner(image_features) # (b, c, prompt_len, embed_dim)
+        # Initial image encoding
+        x = self.image_encoder.conv1(image.type(self.dtype))
+        x = x.reshape(x.shape[0], x.shape[1], -1)
+        x = x.permute(0, 2, 1)
+        x = torch.cat([self.image_encoder.class_embedding.to(x.dtype) + torch.zeros(x.shape[0], 1, x.shape[-1], dtype=x.dtype, device=x.device), x], dim=1)
+        x = x + self.image_encoder.positional_embedding.to(x.dtype)
+        x = self.image_encoder.ln_pre(x)
         
-        b, c, prompt_len, dim = prompts.shape
+        # --- FIX: Cast input to the correct dtype before the transformer ---
+        x = x.to(self.dtype)
         
-        # 3. Encode text prompts
-        prompts = prompts.view(b * c, prompt_len, dim)
+        x = x.permute(1, 0, 2) # (L, N, D)
         
-        x = prompts + self.clip_model.positional_embedding
-        # This line correctly casts the combined prompts back to the CLIP model's
-        # expected dtype (e.g., float16) before passing to the transformer.
-        x = x.to(self.clip_model.dtype)
-        
-        x = x.permute(1, 0, 2)
-        x = self.clip_model.transformer(x)
-        x = x.permute(1, 0, 2)
-        x = self.clip_model.ln_final(x)
+        # Loop through vision transformer blocks and inject prompts
+        for i, res_block in enumerate(self.image_encoder.transformer.resblocks):
+            if i < self.prompt_learner.num_deep_layers:
+                # Prepend deep vision prompt for this layer
+                deep_prompt = self.prompt_learner.deep_vision_prompts[i].unsqueeze(1).expand(-1, x.shape[1], -1)
+                x = torch.cat([x, deep_prompt], dim=0)
+            
+            x = res_block(x)
+            
+            if i < self.prompt_learner.num_deep_layers:
+                # Remove the prompt tokens after the block
+                x = x[:-self.prompt_learner.deep_n_ctx, :, :]
 
+        x = x.permute(1, 0, 2)
+        x = self.image_encoder.ln_post(x[:, 0, :])
+        image_features = x @ self.image_encoder.proj
+        
+        # ================== 2. Text Forward Pass with Deep Prompts ===================
+        
+        # Get the instance-conditioned input-level prompt
+        input_text_prompts = self.prompt_learner(image_features.detach())
+        b, c, prompt_len, dim = input_text_prompts.shape[0], self.prompt_learner.n_cls, self.prompt_learner.n_ctx, input_text_prompts.shape[-1]
+        
+        # Prepare tokens
+        token_prefix = self.token_embedding(self.tokenized_prompts[:, :1])
+        token_suffix = self.token_embedding(self.tokenized_prompts[:, 1 + prompt_len:])
+        
+        # Create full prompts for each image in the batch
+        prompts = []
+        for i in range(b):
+            # For each image, create prompts for all classes
+            p_i = input_text_prompts[i].unsqueeze(0).expand(c, -1, -1)
+            prefix_i = token_prefix.expand(b, -1, -1, -1)[0] # Use class-agnostic prefix
+            suffix_i = token_suffix.expand(b, -1, -1, -1)[0]
+            
+            prompts_i = torch.cat([prefix_i, p_i, suffix_i], dim=1)
+            prompts.append(prompts_i)
+        
+        x = torch.cat(prompts, dim=0) # (B * C, L, D)
+        x = x + self.positional_embedding
+
+        # --- FIX: Cast input to the correct dtype before the transformer ---
+        x = x.to(self.dtype)
+
+        x = x.permute(1, 0, 2) # (L, B * C, D)
+        
+        # Loop through text transformer blocks and inject prompts
+        for i, res_block in enumerate(self.text_encoder.resblocks):
+            if i < self.prompt_learner.num_deep_layers:
+                # Prepend deep text prompt for this layer
+                deep_prompt = self.prompt_learner.deep_text_prompts[i].unsqueeze(1).expand(-1, x.shape[1], -1)
+                x = torch.cat([x, deep_prompt], dim=0)
+                
+            # --- FIX START ---
+            # Store the original mask to restore it later
+            original_mask = res_block.attn_mask
+            current_seq_len = x.shape[0]
+
+            # If the sequence length is different from the mask's, create a new one
+            if original_mask is None or original_mask.shape[0] != current_seq_len:
+                # Create a new causal mask with the correct dimensions
+                new_mask = torch.empty(current_seq_len, current_seq_len, device=x.device)
+                new_mask.fill_(float("-inf"))
+                new_mask.triu_(1) # Ensure tokens only attend to previous tokens
+                res_block.attn_mask = new_mask.to(x.dtype)
+            
+            x = res_block(x)
+
+            # Restore the original mask
+            res_block.attn_mask = original_mask
+            # --- FIX END ---
+            
+            if i < self.prompt_learner.num_deep_layers:
+                # Remove the prompt tokens after the block
+                x = x[:-self.prompt_learner.deep_n_ctx, :, :]
+        
+        x = x.permute(1, 0, 2)
+        x = self.ln_final(x)
+        
         eot_indices = self.tokenized_prompts.argmax(dim=-1).repeat(b)
-        
         text_features_pre = x[torch.arange(x.shape[0]), eot_indices]
-        text_features = text_features_pre @ self.clip_model.text_projection
-        
+        text_features = text_features_pre @ self.text_projection
         text_features = text_features.view(b, c, -1)
         
-        # 4. Normalize features and calculate logits
+        # ====================== 3. Compute Logits =======================
         image_features = image_features / image_features.norm(dim=-1, keepdim=True)
         text_features = text_features / text_features.norm(dim=-1, keepdim=True)
         
-        logit_scale = self.clip_model.logit_scale.exp()
-        logits = logit_scale * torch.sum(image_features.unsqueeze(1) * text_features, dim=-1)
+        logits = self.logit_scale.exp() * torch.sum(image_features.unsqueeze(1) * text_features, dim=-1)
         
         return logits
 
 # %%
 # =============================================================================
-# 5. Data Loading and Preprocessing
+# 4. Data Loading and Preprocessing
 # =============================================================================
 
 # Load CLIP model and preprocessing
@@ -294,7 +321,7 @@ class_prompts = {
  "Knee_ZimmerBiomet_Oxford": "A unicompartmental knee arthroplasty (UKA). Implants are seen on only one side of the knee joint. It consists of a small, C-shaped femoral runner and a small metal tibial tray, making it much smaller than a TKA."
 }
 prompts = [class_prompts[name] for name in unique_labels]
-n_ctx = 16 # Number of context tokens
+n_ctx = 2 # Number of context tokens for input-level prompts
 prompts_with_ctx = [ " ".join(["X"] * n_ctx) + " " + p for p in prompts]
 tokenized_prompts = torch.cat([clip.tokenize(p) for p in prompts_with_ctx]).to(device)
 
@@ -304,29 +331,23 @@ def process_labels(labels):
 
 # %%
 # =============================================================================
-# 6. CoCoOp Training Pipeline
+# 5. MaPLe Training Pipeline
 # =============================================================================
-def train_cocoop():
-    """Trains the CoCoOp model."""
-    print("\n--- Starting CoCoOp Training ---")
+def train_maple():
+    """Trains the MaPLe model."""
+    print("\n--- Starting MaPLe Training ---")
     
     # Initialize models
-    prompt_learner = CoCoOpPromptLearner(
+    # We use deep prompts for the first 3 layers of each transformer
+    prompt_learner = MaPLePromptLearner(
         clip_model=model,
         n_cls=num_classes,
         n_ctx=n_ctx,
-        tokenized_prompts=tokenized_prompts
+        deep_n_ctx=2,
+        num_deep_layers=3
     ).to(device)
     
-    cocoop_clip = CoCoOpCLIP(model, prompt_learner, tokenized_prompts).to(device)
-    # Load pre-trained weights if the file exists
-    model_weights_path = f'weights{os.sep}task_1_3_best_cocoop_model.pth'
-    if os.path.exists(model_weights_path):
-        print(f"Loading existing weights from: {model_weights_path}")
-        cocoop_clip.load_state_dict(torch.load(model_weights_path, map_location=device))
-        print("Weights loaded successfully. Resuming training...")
-    else:
-        print("No existing weights found. Starting training from scratch.")
+    maple_clip = MaPLeCLIP(model, prompt_learner, tokenized_prompts).to(device)
     
     # Training settings
     optimizer = optim.AdamW(prompt_learner.parameters(), lr=0.002)
@@ -338,11 +359,11 @@ def train_cocoop():
     patience_counter = 0
     
     # Training loop
-    train_loader = DataLoader(train_dataset, batch_size=64, shuffle=True)
+    train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True) # Reduced batch size for higher memory usage
     history = defaultdict(list)
     
     for epoch in range(100):
-        cocoop_clip.train()
+        maple_clip.train()
         epoch_loss = 0
         
         with tqdm(train_loader, desc=f'Epoch {epoch+1}/100') as pbar:
@@ -351,7 +372,7 @@ def train_cocoop():
                 labels = process_labels(labels)
                 
                 optimizer.zero_grad()
-                logits = cocoop_clip(images)
+                logits = maple_clip(images)
                 loss = criterion(logits, labels)
                 
                 loss.backward()
@@ -367,14 +388,14 @@ def train_cocoop():
         if avg_loss < best_loss:
             best_loss = avg_loss
             patience_counter = 0
-            torch.save(cocoop_clip.state_dict(), f'{weights_folder}{os.sep}task_1_3_best_cocoop_model.pth')
+            torch.save(maple_clip.state_dict(), f'{weights_folder}{os.sep}best_maple_model.pth')
             
             # Save training history
-            history_path = f'{results_folder}{os.sep}task_1_3_cocoop_training_history_{datetime.now().strftime("%Y%m%dT%H%M%S")}.json'
+            history_path = f'{results_folder}{os.sep}maple_training_history_{datetime.now().strftime("%Y%m%dT%H%M%S")}.json'
             with open(history_path, 'w') as f:
                 json.dump(history, f)
             print(f"Training history saved to {history_path}")
-    
+            
         else:
             patience_counter += 1
             
@@ -385,27 +406,28 @@ def train_cocoop():
         print(f'Epoch {epoch+1}: Loss = {avg_loss:.4f}')
 
 # =============================================================================
-# 7. CoCoOp Inference Pipeline
+# 6. MaPLe Inference Pipeline
 # =============================================================================
-def evaluate_cocoop_model(model_path):
-    """Loads a trained CoCoOp-CLIP model and evaluates it on the test set."""
-    print("\n--- Running CoCoOp Evaluation ---")
+def evaluate_maple_model(model_path):
+    """Loads a trained MaPLe-CLIP model and evaluates it on the test set."""
+    print("\n--- Running MaPLe Evaluation ---")
     
     # Initialize a new model instance
-    prompt_learner = CoCoOpPromptLearner(
+    prompt_learner = MaPLePromptLearner(
         clip_model=model,
         n_cls=num_classes,
         n_ctx=n_ctx,
-        tokenized_prompts=tokenized_prompts
+        deep_n_ctx=2,
+        num_deep_layers=3
     ).to(device)
     
-    loaded_model = CoCoOpCLIP(model, prompt_learner, tokenized_prompts).to(device)
+    loaded_model = MaPLeCLIP(model, prompt_learner, tokenized_prompts).to(device)
 
     # Load the saved state dictionary
     loaded_model.load_state_dict(torch.load(model_path, map_location=device))
     loaded_model.eval()
 
-    test_loader = DataLoader(test_dataset, batch_size=128, shuffle=False)
+    test_loader = DataLoader(test_dataset, batch_size=64, shuffle=False)
 
     all_labels = []
     all_preds = []
@@ -420,41 +442,20 @@ def evaluate_cocoop_model(model_path):
 
             all_labels.extend(labels)
             all_preds.extend(le.inverse_transform(preds.cpu().numpy()))
-            all_pred_probas.extend(probas.cpu().numpy())
+            
+            # Ensure probabilities are handled correctly for metrics
+            probas_np = probas.cpu().numpy().astype(np.float64)
+            all_pred_probas.extend(probas_np)
 
-    results = evaluate_metrics(all_labels, all_preds, all_pred_probas)
+    results = evaluate_metrics(all_labels, all_preds, all_pred_probas, le)
     return results
 
 # %%
 # =============================================================================
-# 8. Main Execution Block
+# 7. Main Execution Block
 # =============================================================================
 if __name__ == "__main__":
     
-    # Train the CoCoOp model
-    train_cocoop()
-    
-    # # --- INFERENCE AND EVALUATION ---
-    # model_weights_path = f'{weights_folder}{os.sep}task_1_3_best_cocoop_model.pth'
-    
-    # if os.path.exists(model_weights_path):
-    #     metrics = evaluate_cocoop_model(model_weights_path)
-        
-    #     print("\n--- CoCoOp Evaluation Results ---")
-    #     print(f"  Accuracy: {metrics['accuracy']:.4f}")
-    #     print(f"  F1-Score: {metrics['f1_score']:.4f}")
-    #     print(f"  AUC-ROC:  {metrics['auc_roc']:.4f}")
-        
-    #     # Save Results to JSON
-    #     results_path = f"{results_folder}{os.sep}task-1_3_cocoop_results.json"
-    #     with open(results_path, "w") as file:
-    #         json.dump({
-    #             "Top-1 Accuracy": f"{metrics['accuracy']:.4f}",
-    #             "F1-Score": f"{metrics['f1_score']:.4f}",
-    #             "AUC-ROC": f"{metrics['auc_roc']:.4f}"
-    #         }, file, indent=4)
-    #     print(f"\nResults saved to {results_path}")
-        
-    # else:
-    #     print(f"Model weights not found at '{model_weights_path}'.")
-    #     print("Please train the model first by running this script.")
+    # Train the MaPLe model
+    train_maple()
+# %%
