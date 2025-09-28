@@ -66,8 +66,18 @@ def zero_shot_prediction(model, dataset, class_prompts, device):
     return all_predictions, np.array(all_probs), all_labels
 
 def evaluate_metrics(y_true, y_pred, y_pred_proba):
-    # Calculate metrics
+    # Calculate top-1 accuracy
     accuracy = accuracy_score(y_true, y_pred)
+    
+    # Calculate top-3 accuracy
+    top3_accuracy = 0
+    for i in range(len(y_true)):
+        top3_pred = np.argsort(y_pred_proba[i])[-3:]
+        if np.where(np.array(list(class_prompts.keys())) == y_true[i])[0][0] in top3_pred:
+            top3_accuracy += 1
+    top3_accuracy = top3_accuracy / len(y_true)
+    
+    # Calculate F1-score
     f1 = f1_score(y_true, y_pred, average='weighted')
     
     # Convert labels to numerical format for AUC-ROC
@@ -79,6 +89,7 @@ def evaluate_metrics(y_true, y_pred, y_pred_proba):
     
     return {
         'accuracy': accuracy,
+        'top3_accuracy': top3_accuracy,
         'f1_score': f1,
         'auc_roc': auc_roc
     }
@@ -188,8 +199,8 @@ if __name__ == "__main__":
     # Save Results
     with open(f"results{os.sep}task-2_2.json", "w") as file:
         file.write(json.dumps({
-            "Top-1 Accuracy": f"{metrics['accuracy']:.4f}", \
-            "F1-Score": f"{metrics['f1_score']:.4f}", \
+            "Top-1 Accuracy": f"{metrics['accuracy']:.4f}",
+            "Top-3 Accuracy": f"{metrics['top3_accuracy']:.4f}",
+            "F1-Score": f"{metrics['f1_score']:.4f}",
             "AUC-ROC": f"{metrics['auc_roc']:.4f}"
         }))
-    
