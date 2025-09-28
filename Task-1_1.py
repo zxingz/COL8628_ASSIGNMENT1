@@ -338,8 +338,8 @@ if __name__ == "__main__":
 
     for variant in MODEL_VARIANTS.keys():
         
-        if 'dino' not in variant.lower():
-            continue
+        # if 'dino' not in variant.lower():
+        #     continue
         
         print(f"\n{'='*20} Processing Model: {variant.upper()} {'='*20}")
         
@@ -381,7 +381,7 @@ if __name__ == "__main__":
                         patience=2
                     )
         
-        model_save_path = os.path.join(CONFIG["weights_folder"], f"best_vit_{variant}.pth")
+        model_save_path = os.path.join(CONFIG["weights_folder"], f"task-1_1_best_vit_{variant}.pth")
         
         # MODIFICATION: Check for existing weights and load them to resume training
         if os.path.exists(model_save_path):
@@ -417,7 +417,7 @@ if __name__ == "__main__":
             scheduler.step(avg_train_loss)  # Update learning rate based on training loss
 
         # Save the collected training history to a JSON file
-        history_save_path = os.path.join(CONFIG["results_folder"], f'training_history_{variant}_{datetime.now().strftime("%Y%m%dT%H%M%S")}.json')
+        history_save_path = os.path.join(CONFIG["results_folder"], f'task-1_1_training_history_{variant}_{datetime.now().strftime("%Y%m%dT%H%M%S")}.json')
         with open(history_save_path, 'w') as f:
             json.dump(history, f, indent=4)
         print(f"Training history saved to {history_save_path}")
