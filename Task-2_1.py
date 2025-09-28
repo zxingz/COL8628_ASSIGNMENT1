@@ -42,7 +42,7 @@ CONFIG = {
     "train_data_folder": f"data{os.sep}pacemakers{os.sep}Train",
     "weights_folder": "weights", # This folder is no longer used for saving in this script
     "results_folder": "results",
-    "num_epochs": 1,
+    "num_epochs": 10,
     "batch_size": 16,
     "learning_rate": 1e-4,
 }
@@ -102,29 +102,22 @@ class ClipViTForClassification(nn.Module):
         self.dropout = nn.Dropout(0.1)
         self.head = nn.Linear(feature_dim, num_classes)
         
-        # Freeze CLIP visual encoder
-        for param in self.visual.parameters():
-            param.requires_grad = False
-            
-        # Convert visual module to float16 to match CLIP's weights
-        self.visual = self.visual.half()
+        # Convert entire visual module to float32 instead of half
+        self.visual = self.visual.float()
         
     def forward(self, image):
         try:
-            # Convert input to float16 (half precision)
-            image = image.half()
+            # Ensure input is float32
+            image = image.float()
             
             # Normalize input to [-1, 1]
             if image.max() > 1.0:
                 image = image / 255.0
             image = 2 * image - 1
             
-            # Get visual features using half precision
+            # Get visual features
             with torch.no_grad():
                 image_features = self.visual(image)
-            
-            # Convert back to float32 for the rest of processing
-            image_features = image_features.float()
             
             # Apply preprocessing
             image_features = self.ln(image_features)
@@ -146,7 +139,7 @@ class ClipViTForClassification(nn.Module):
             print(f"Error in forward pass: {e}")
             return torch.zeros((image.shape[0], self.head.out_features), 
                              device=image.device, 
-                             dtype=torch.float32,  # Ensure output is float32
+                             dtype=torch.float32,
                              requires_grad=True)
 
 
@@ -245,24 +238,34 @@ def evaluate_model(model, dataloader):
     all_labels = []
     all_preds = []
     all_probas = []
+    all_top3_correct = []
 
     with torch.no_grad():
         for images, labels in tqdm(dataloader, desc="Evaluating"):
             try:
+                # Move both images and labels to the same device
                 images = images.to(device)
+                labels = labels.to(device)  # Move labels to device
                 
                 outputs = model(images)
                 # Add numerical stability to softmax
-                outputs = outputs - outputs.max(dim=1, keepdim=True)[0]  # Subtract max for numerical stability
+                outputs = outputs - outputs.max(dim=1, keepdim=True)[0]
                 probas = torch.softmax(outputs, dim=1)
                 
-                # Check for NaN values
                 if torch.isnan(probas).any():
                     print("Warning: NaN values detected in probabilities")
                     continue
                 
+                # --- Top-1 Prediction ---
                 preds = torch.argmax(probas, dim=1)
 
+                # --- Top-3 Accuracy Calculation ---
+                _, top3_indices = torch.topk(probas, 3, dim=1)
+                labels_reshaped = labels.view(-1, 1)  # Labels are now on device
+                top3_correct = (labels_reshaped == top3_indices).any(dim=1)
+
+                # Move to CPU only when converting to numpy
+                all_top3_correct.extend(top3_correct.cpu().numpy())
                 all_labels.extend(labels.cpu().numpy())
                 all_preds.extend(preds.cpu().numpy())
                 all_probas.extend(probas.cpu().detach().numpy())
@@ -271,16 +274,20 @@ def evaluate_model(model, dataloader):
                 print(f"Error in evaluation batch: {e}")
                 continue
 
+    # Rest of the function remains the same
     # Convert to numpy arrays
     all_labels = np.array(all_labels)
     all_preds = np.array(all_preds)
     all_probas = np.array(all_probas)
+    all_top3_correct = np.array(all_top3_correct)
 
-    # Check if we have any valid predictions
+    # ... rest of the existing evaluation code ...
+
     if len(all_labels) == 0:
         print("Warning: No valid predictions were made")
         return {
             'Top-1 Accuracy': 0.0,
+            'Top-3 Accuracy': 0.0, # <-- ADDED
             'F1-Score': 0.0,
             'AUC-ROC': 0.0
         }
@@ -290,16 +297,16 @@ def evaluate_model(model, dataloader):
     all_labels = all_labels[mask]
     all_preds = all_preds[mask]
     all_probas = all_probas[mask]
+    all_top3_correct = all_top3_correct[mask] # <-- ADDED
 
-    # Compute metrics
     try:
         lb = LabelBinarizer()
         y_true_bin = lb.fit_transform(all_labels)
         
         accuracy = accuracy_score(all_labels, all_preds)
+        top3_accuracy = np.mean(all_top3_correct) # <-- ADDED
         f1 = f1_score(all_labels, all_preds, average='weighted')
         
-        # Only compute AUC-ROC if we have valid probabilities
         if np.isfinite(all_probas).all() and len(np.unique(all_labels)) > 1:
             auc_roc = roc_auc_score(y_true_bin, all_probas, multi_class='ovr')
         else:
@@ -310,15 +317,18 @@ def evaluate_model(model, dataloader):
         print(f"Error computing metrics: {e}")
         return {
             'Top-1 Accuracy': 0.0,
+            'Top-3 Accuracy': 0.0, # <-- ADDED
             'F1-Score': 0.0,
             'AUC-ROC': 0.0
         }
 
     return {
         'Top-1 Accuracy': accuracy,
+        'Top-3 Accuracy': top3_accuracy, # <-- ADDED
         'F1-Score': f1,
         'AUC-ROC': auc_roc
     }
+
 
 # %%
 # =============================================================================
@@ -356,6 +366,9 @@ if __name__ == "__main__":
     all_results = {}
 
     for variant in MODEL_VARIANTS.keys():
+        
+        # if 'clip' not in variant.lower():
+        #     continue
         
         # if 'dino' not in variant.lower():
         #     continue

@@ -40,7 +40,7 @@ CONFIG = {
     "data_folder": f"data{os.sep}orthonet{os.sep}orthonet data{os.sep}orthonet data",
     "weights_folder": "weights", # This folder is no longer used for saving in this script
     "results_folder": "results",
-    "num_epochs": 1,
+    "num_epochs": 10,
     "batch_size": 16,
     "learning_rate": 1e-4,
 }
