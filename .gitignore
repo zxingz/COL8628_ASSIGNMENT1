@@ -16,3 +16,4 @@ logs/
 checkpoints/
 
 *.pth
+weights/task_1_3_best_coop_model.pth
