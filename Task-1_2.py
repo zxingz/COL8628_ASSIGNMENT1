@@ -162,7 +162,7 @@ if __name__ == "__main__":
     metrics = evaluate_metrics(true_labels, predictions, probs)
     
     # Save Results
-    with open(f"results{os.sep}task-2_1.json", "w") as file:
+    with open(f"results{os.sep}task-1_2.json", "w") as file:
         file.write(json.dumps({
             "Top-1 Accuracy": f"{metrics['accuracy']:.4f}", \
             "F1-Score": f"{metrics['f1_score']:.4f}", \
