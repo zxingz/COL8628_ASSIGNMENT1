@@ -1,6 +1,7 @@
 # %%
 import os
 import json
+from glob import glob
 
 import torch
 
@@ -84,17 +85,15 @@ def evaluate_metrics(y_true, y_pred, y_pred_proba):
 
 # Classes
 class PacemakerDataset(Dataset):
-    def __init__(self, data, img_dir, preprocess):
+    def __init__(self, data, preprocess):
         self.data = data
-        self.img_dir = img_dir
         self.preprocess = preprocess
         
     def __len__(self):
         return len(self.data)
     
     def __getitem__(self, idx):
-        img_name = os.path.join(self.img_dir, self.data.iloc[idx]['filenames'])
-        image = Image.open(img_name).convert('RGB')
+        image = Image.open(self.data.iloc[idx]['filenames']).convert('RGB')
         image = self.preprocess(image)
         label = self.data.iloc[idx]['labels']
         return image, label
@@ -159,13 +158,26 @@ class_prompts = {
 }
 print(len(class_prompts), "class prompts defined.")
 
+
 # %%
 if __name__ == "__main__":
     
     # Dataset paths
     
+    # Create DataFrame
+    pacemaker_test = pd.DataFrame()
+    for folder in glob(f"{test_folder}{os.sep}*"):
+        label, version = os.path.basename(folder).split(' - ')
+        for file in glob(f"{folder}{os.sep}*"):
+            pacemaker_test = pd.concat([pacemaker_test, pd.DataFrame([{
+                'filenames': file,
+                'labels': f"({label}, {version})",
+            }])], ignore_index=True)
+    pacemaker_test = pacemaker_test.reset_index(drop=True)
+    
     # Create datasets
-    test_dataset = PacemakerDataset(test_csv, data_folder, preprocess)
+    test_dataset = PacemakerDataset(data=pacemaker_test, \
+                                    preprocess=preprocess)
     
     # Get predictions
     predictions, probs, true_labels = zero_shot_prediction(model, test_dataset, class_prompts, device)
@@ -174,7 +186,7 @@ if __name__ == "__main__":
     metrics = evaluate_metrics(true_labels, predictions, probs)
     
     # Save Results
-    with open(f"results{os.sep}task-2_1.json", "w") as file:
+    with open(f"results{os.sep}task-2_2.json", "w") as file:
         file.write(json.dumps({
             "Top-1 Accuracy": f"{metrics['accuracy']:.4f}", \
             "F1-Score": f"{metrics['f1_score']:.4f}", \
