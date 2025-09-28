@@ -41,15 +41,17 @@ os.makedirs(weights_folder, exist_ok=True)
 os.makedirs(results_folder, exist_ok=True)
 
 
-def evaluate_metrics(y_true, y_pred, y_pred_proba):
-    """Calculates accuracy, F1-score, and AUC-ROC."""
+def evaluate_metrics(y_true, y_pred, y_pred_proba, label_encoder):
+    """
+    Calculates accuracy, F1-score, and AUC-ROC.
+    Accepts a pre-fitted label_encoder to ensure consistent class mapping.
+    """
     # Calculate metrics
     accuracy = accuracy_score(y_true, y_pred)
     f1 = f1_score(y_true, y_pred, average='weighted')
     
-    # Convert labels to numerical format for AUC-ROC
-    le = LabelEncoder()
-    y_true_encoded = le.fit_transform(y_true)
+    # Use the provided, globally-fitted label encoder to transform true labels
+    y_true_encoded = label_encoder.transform(y_true)
     
     # Calculate AUC-ROC
     auc_roc = roc_auc_score(y_true_encoded, y_pred_proba, multi_class='ovr')
@@ -182,12 +184,10 @@ class CoCoOpPromptLearner(nn.Module):
         """
         # image_features are float16 from CLIP's encoder
         
-        # === FIX STARTS HERE ===
         # Cast image_features to float32 to match the meta_net's weights.
         # We use self.ctx.dtype as a robust way to get the target type (float32).
         image_features_float32 = image_features.type(self.ctx.dtype)
         delta = self.meta_net(image_features_float32) # shape: (batch_size, ctx_dim)
-        # === FIX ENDS HERE ===
         
         # Add delta to base context vectors
         ctx_shifted = self.ctx.unsqueeze(0) + delta.unsqueeze(1)
@@ -273,6 +273,7 @@ train_dataset = OrthonetDataset(train_csv, data_folder, preprocess)
 test_dataset = OrthonetDataset(test_csv, data_folder, preprocess)
 
 # Create label encoder for consistent label mapping
+# This `le` is now the single source of truth for label encoding
 le = LabelEncoder()
 unique_labels = sorted(list(set(train_dataset.data['labels'])))
 le.fit(unique_labels)
@@ -411,9 +412,24 @@ def evaluate_cocoop_model(model_path):
 
             all_labels.extend(labels)
             all_preds.extend(le.inverse_transform(preds.cpu().numpy()))
-            all_pred_probas.extend(probas.cpu().numpy())
+            
+            # Convert to numpy with higher precision
+            probas_np = probas.cpu().numpy().astype(np.float64)
+            # Normalize to exactly sum to 1.0000
+            row_sums = probas_np.sum(axis=1, keepdims=True)
+            probas_np = np.round(probas_np / row_sums, decimals=4)
+            # Ensure any remaining rounding errors are fixed
+            residuals = 1.0000 - probas_np.sum(axis=1, keepdims=True)
+            # Add residual to the largest probability in each row
+            max_indices = probas_np.argmax(axis=1)
+            probas_np[np.arange(len(probas_np)), max_indices] += residuals.flatten()
+            
+            all_pred_probas.extend(probas_np)
 
-    results = evaluate_metrics(all_labels, all_preds, all_pred_probas)
+    # === FIX STARTS HERE ===
+    # Pass the global `le` object to the metrics function
+    results = evaluate_metrics(all_labels, all_preds, all_pred_probas, le)
+    # === FIX ENDS HERE ===
     return results
 
 # %%
@@ -449,3 +465,4 @@ if __name__ == "__main__":
     else:
         print(f"Model weights not found at '{model_weights_path}'.")
         print("Please train the model first by running this script.")
+# %%
