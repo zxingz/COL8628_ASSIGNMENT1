@@ -104,26 +104,23 @@ class ClipViTForClassification(nn.Module):
         # Freeze CLIP visual encoder
         for param in self.visual.parameters():
             param.requires_grad = False
-            
-        # Convert visual module to float16 to match CLIP's weights
-        self.visual = self.visual.half()
+        
+        # Convert entire visual module to float32 instead of half
+        self.visual = self.visual.float()
         
     def forward(self, image):
         try:
-            # Convert input to float16 (half precision)
-            image = image.half()
+            # Ensure input is float32
+            image = image.float()
             
             # Normalize input to [-1, 1]
             if image.max() > 1.0:
                 image = image / 255.0
             image = 2 * image - 1
             
-            # Get visual features using half precision
+            # Get visual features
             with torch.no_grad():
                 image_features = self.visual(image)
-            
-            # Convert back to float32 for the rest of processing
-            image_features = image_features.float()
             
             # Apply preprocessing
             image_features = self.ln(image_features)
@@ -145,7 +142,7 @@ class ClipViTForClassification(nn.Module):
             print(f"Error in forward pass: {e}")
             return torch.zeros((image.shape[0], self.head.out_features), 
                              device=image.device, 
-                             dtype=torch.float32,  # Ensure output is float32
+                             dtype=torch.float32,
                              requires_grad=True)
 
 
@@ -339,6 +336,9 @@ if __name__ == "__main__":
     for variant in MODEL_VARIANTS.keys():
         
         # if 'dino' not in variant.lower():
+        #     continue
+        
+        # if 'clip' not in variant.lower():
         #     continue
         
         print(f"\n{'='*20} Processing Model: {variant.upper()} {'='*20}")
