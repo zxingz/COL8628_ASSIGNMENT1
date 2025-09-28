@@ -341,11 +341,11 @@ def train_cocoop():
     train_loader = DataLoader(train_dataset, batch_size=64, shuffle=True)
     history = defaultdict(list)
     
-    for epoch in range(100):
+    for epoch in range(10):
         cocoop_clip.train()
         epoch_loss = 0
         
-        with tqdm(train_loader, desc=f'Epoch {epoch+1}/100') as pbar:
+        with tqdm(train_loader, desc=f'Epoch {epoch+1}/10') as pbar:
             for images, labels in pbar:
                 images = images.to(device)
                 labels = process_labels(labels)
