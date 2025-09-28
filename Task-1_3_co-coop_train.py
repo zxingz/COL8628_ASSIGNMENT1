@@ -99,14 +99,14 @@ class CoCoOpPromptLearner(nn.Module):
         # Base learnable context vectors (like CoOp)
         ctx_vectors = torch.empty(n_ctx, ctx_dim)
         nn.init.normal_(ctx_vectors, std=0.02)
-        self.ctx = nn.Parameter(ctx_vectors)
+        self.ctx = nn.Parameter(ctx_vectors) # self.ctx is float32 by default
         
         # Meta-network to generate instance-specific token from image features
         self.meta_net = nn.Sequential(
             nn.Linear(clip_im_dim, clip_im_dim // 16),
             nn.ReLU(),
             nn.Linear(clip_im_dim // 16, ctx_dim)
-        )
+        ) # self.meta_net weights are float32 by default
         
         # Pre-computed embeddings for prompt components
         with torch.no_grad():
@@ -119,10 +119,14 @@ class CoCoOpPromptLearner(nn.Module):
         """
         Generates dynamic prompts based on image features.
         """
-        # image_features shape: (batch_size, clip_im_dim)
+        # image_features are float16 from CLIP's encoder
         
-        # Generate instance-specific delta
-        delta = self.meta_net(image_features) # shape: (batch_size, ctx_dim)
+        # === FIX STARTS HERE ===
+        # Cast image_features to float32 to match the meta_net's weights.
+        # We use self.ctx.dtype as a robust way to get the target type (float32).
+        image_features_float32 = image_features.type(self.ctx.dtype)
+        delta = self.meta_net(image_features_float32) # shape: (batch_size, ctx_dim)
+        # === FIX ENDS HERE ===
         
         # Add delta to base context vectors
         ctx_shifted = self.ctx.unsqueeze(0) + delta.unsqueeze(1)
@@ -150,10 +154,11 @@ class CoCoOpCLIP(nn.Module):
         self.register_buffer("tokenized_prompts", tokenized_prompts)
         
     def forward(self, image):
-        # 1. Encode image
+        # 1. Encode image. Output is likely float16.
         image_features = self.clip_model.encode_image(image) # (b, feat_dim)
         
-        # 2. Generate dynamic prompts based on image features
+        # 2. Generate dynamic prompts based on image features.
+        # The prompt_learner now handles the dtype conversion internally.
         prompts = self.prompt_learner(image_features) # (b, c, prompt_len, embed_dim)
         
         b, c, prompt_len, dim = prompts.shape
@@ -162,6 +167,8 @@ class CoCoOpCLIP(nn.Module):
         prompts = prompts.view(b * c, prompt_len, dim)
         
         x = prompts + self.clip_model.positional_embedding
+        # This line correctly casts the combined prompts back to the CLIP model's
+        # expected dtype (e.g., float16) before passing to the transformer.
         x = x.to(self.clip_model.dtype)
         
         x = x.permute(1, 0, 2)
@@ -292,6 +299,13 @@ def train_cocoop():
             best_loss = avg_loss
             patience_counter = 0
             torch.save(cocoop_clip.state_dict(), f'{weights_folder}{os.sep}task_1_3_best_cocoop_model.pth')
+            
+            # Save training history
+            history_path = f'{results_folder}{os.sep}task_1_3_cocoop_training_history_{datetime.now().strftime("%Y%m%dT%H%M%S")}.json'
+            with open(history_path, 'w') as f:
+                json.dump(history, f)
+            print(f"Training history saved to {history_path}")
+            
         else:
             patience_counter += 1
             
@@ -300,12 +314,6 @@ def train_cocoop():
             break
             
         print(f'Epoch {epoch+1}: Loss = {avg_loss:.4f}')
-        
-    # Save training history
-    history_path = f'{results_folder}{os.sep}task_1_3_cocoop_training_history.json'
-    with open(history_path, 'w') as f:
-        json.dump(history, f)
-    print(f"Training history saved to {history_path}")
 
 # =============================================================================
 # 6. CoCoOp Inference Pipeline
