@@ -146,12 +146,18 @@ class MaPLeCLIP(nn.Module):
         )
 
     def encode_image(self, image, deep_vision_prompts):
-        # Cast image to float32 before processing
-        x = self.clip_model.visual.conv1(image.type(torch.float32))
+        """Encodes image with deep prompt injection."""
+        # Ensure float32 type consistently
+        image = image.float()  # Convert to float32
+        x = self.clip_model.visual.conv1(image)
         x = x.reshape(x.shape[0], x.shape[1], -1).permute(0, 2, 1)
-        x = torch.cat([self.clip_model.visual.class_embedding.to(x.dtype) + torch.zeros(x.shape[0], 1, x.shape[-1], dtype=x.dtype, device=x.device), x], dim=1)
+        x = torch.cat([
+            self.clip_model.visual.class_embedding.to(x.dtype) + 
+            torch.zeros(x.shape[0], 1, x.shape[-1], dtype=x.dtype, device=x.device), 
+            x
+        ], dim=1)
         x = x + self.clip_model.visual.positional_embedding.to(x.dtype)
-        x = self.clip_model.visual.ln_pre(x)
+        x = self.clip_model.visual.ln_pre(x.float())  # Ensure float32 before layer norm
         x = x.permute(1, 0, 2)
 
         # Inject deep prompts into specified layers
@@ -398,36 +404,30 @@ def evaluate_maple_model(model_path):
     """Loads a trained MaPLe-CLIP model and evaluates it on the test set."""
     print("\n--- Running MaPLe Evaluation ---")
     
-    # Initialize a new model instance
+    # Initialize models in float32
     prompt_learner = MaPLePromptLearner(
         clip_model=model,
         n_cls=num_classes,
         n_ctx=n_ctx,
         n_deep=n_deep,
         tokenized_prompts=tokenized_prompts
-    ).to(device)
+    ).to(device).float()  # Ensure float32
     
-    loaded_model = MaPLeCLIP(model, prompt_learner, tokenized_prompts).to(device)
+    loaded_model = MaPLeCLIP(model, prompt_learner, tokenized_prompts).to(device).float()  # Ensure float32
 
     # Load the saved state dictionary
     loaded_model.load_state_dict(torch.load(model_path, map_location=device))
-    
-    # ========================= FIX =========================
-    # Also cast the model to the correct dtype for evaluation.
-    loaded_model.to(model.dtype)
-    # =======================================================
-    
     loaded_model.eval()
 
     test_loader = DataLoader(test_dataset, batch_size=128, shuffle=False)
-
+    
     all_labels = []
     all_preds = []
     all_pred_probas = []
 
     with torch.no_grad():
         for images, labels in tqdm(test_loader, desc="Evaluating on Test Set"):
-            images = images.to(device)
+            images = images.to(device).float()  # Ensure float32
             logits = loaded_model(images)
             probas = logits.softmax(dim=-1)
             preds = probas.argmax(dim=-1)

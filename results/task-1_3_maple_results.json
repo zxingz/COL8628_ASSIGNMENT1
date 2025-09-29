@@ -1,5 +1,5 @@
 {
-    "Top-1 Accuracy": "0.1667",
-    "F1-Score": "0.0528",
-    "AUC-ROC": "0.7525"
+    "Top-1 Accuracy": "0.2278",
+    "F1-Score": "0.1302",
+    "AUC-ROC": "0.8044"
 }

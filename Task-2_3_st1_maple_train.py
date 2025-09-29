@@ -167,12 +167,22 @@ class MaPLeCLIP(nn.Module):
         )
 
     def encode_image(self, image, deep_vision_prompts):
-        # Cast image to float32 before processing
-        x = self.clip_model.visual.conv1(image.type(torch.float32))
+        """Encodes image with deep prompt injection."""
+        x = self.clip_model.visual.conv1(image)
         x = x.reshape(x.shape[0], x.shape[1], -1).permute(0, 2, 1)
-        x = torch.cat([self.clip_model.visual.class_embedding.to(x.dtype) + torch.zeros(x.shape[0], 1, x.shape[-1], dtype=x.dtype, device=x.device), x], dim=1)
+        x = torch.cat([
+            self.clip_model.visual.class_embedding.to(x.dtype) + 
+            torch.zeros(x.shape[0], 1, x.shape[-1], dtype=x.dtype, device=x.device), 
+            x
+        ], dim=1)
         x = x + self.clip_model.visual.positional_embedding.to(x.dtype)
+        
+        # Convert to float32 before layer norm
+        x = x.float()
         x = self.clip_model.visual.ln_pre(x)
+        # Convert back to model's dtype
+        x = x.to(self.clip_model.dtype)
+        
         x = x.permute(1, 0, 2)
 
         # Inject deep prompts into specified layers
@@ -188,10 +198,16 @@ class MaPLeCLIP(nn.Module):
             
             # After processing, remove the prompt tokens to maintain sequence length integrity
             if i < self.prompt_learner.n_deep:
-                 x = torch.cat([x[:1], x[1+self.prompt_learner.n_ctx:]], dim=0)
+                x = torch.cat([x[:1], x[1+self.prompt_learner.n_ctx:]], dim=0)
 
         x = x.permute(1, 0, 2)
+        
+        # Convert to float32 for layer norm
+        x = x.float()
         x = self.clip_model.visual.ln_post(x[:, 0, :])
+        # Convert back to model's dtype
+        x = x.to(self.clip_model.dtype)
+        
         if self.clip_model.visual.proj is not None:
             x = x @ self.clip_model.visual.proj
         
@@ -337,6 +353,9 @@ def train_maple():
     
     maple_clip = MaPLeCLIP(model, prompt_learner, tokenized_prompts).to(device)
     
+    # Cast model to CLIP's dtype
+    maple_clip = maple_clip.to(model.dtype)
+    
     # Ensure all components use float32
     maple_clip = maple_clip.float()
     prompt_learner = prompt_learner.float()
@@ -379,7 +398,7 @@ def train_maple():
         
         with tqdm(train_loader, desc=f'Epoch {epoch+1}/10') as pbar:
             for images, labels in pbar:
-                images = images.to(device)
+                images = images.to(device).to(model.dtype)
                 labels = process_labels(labels)
                 
                 optimizer.zero_grad()
@@ -423,7 +442,7 @@ def evaluate_maple_model(model_path):
     """Loads a trained MaPLe-CLIP model and evaluates it on the test set."""
     print("\n--- Running MaPLe Evaluation ---")
     
-    # Initialize a new model instance
+    # Initialize models
     prompt_learner = MaPLePromptLearner(
         clip_model=model,
         n_cls=num_classes,
@@ -437,11 +456,8 @@ def evaluate_maple_model(model_path):
     # Load the saved state dictionary
     loaded_model.load_state_dict(torch.load(model_path, map_location=device))
     
-    # ========================= FIX =========================
-    # Also cast the model to the correct dtype for evaluation.
-    loaded_model.to(model.dtype)
-    # =======================================================
-    
+    # Cast model to same dtype as CLIP model
+    loaded_model = loaded_model.to(model.dtype)
     loaded_model.eval()
 
     test_loader = DataLoader(test_dataset, batch_size=128, shuffle=False)
@@ -452,7 +468,8 @@ def evaluate_maple_model(model_path):
 
     with torch.no_grad():
         for images, labels in tqdm(test_loader, desc="Evaluating on Test Set"):
-            images = images.to(device)
+            # Cast images to same dtype as model
+            images = images.to(device).to(model.dtype)
             logits = loaded_model(images)
             probas = logits.softmax(dim=-1)
             preds = probas.argmax(dim=-1)
@@ -473,29 +490,29 @@ if __name__ == "__main__":
     # Train the MaPLe model
     train_maple()
     
-    # # --- INFERENCE AND EVALUATION ---
-    # model_weights_path = f'{weights_folder}{os.sep}task_2_3_st1_best_maple_model.pth'
+    # --- INFERENCE AND EVALUATION ---
+    model_weights_path = f'{weights_folder}{os.sep}task_2_3_st1_best_maple_model.pth'
     
-    # if os.path.exists(model_weights_path):
-    #     metrics = evaluate_maple_model(model_weights_path)
+    if os.path.exists(model_weights_path):
+        metrics = evaluate_maple_model(model_weights_path)
         
-    #     # In the main execution block:
-    #     print("\n--- MaPLe Evaluation Results ---")
-    #     print(f"  Accuracy: {metrics['accuracy']:.4f}")
-    #     print(f"  Top-3 Accuracy: {metrics['top3_accuracy']:.4f}")
-    #     print(f"  F1-Score: {metrics['f1_score']:.4f}")
-    #     print(f"  AUC-ROC:  {metrics['auc_roc']:.4f}")
+        # In the main execution block:
+        print("\n--- MaPLe Evaluation Results ---")
+        print(f"  Accuracy: {metrics['accuracy']:.4f}")
+        print(f"  Top-3 Accuracy: {metrics['top3_accuracy']:.4f}")
+        print(f"  F1-Score: {metrics['f1_score']:.4f}")
+        print(f"  AUC-ROC:  {metrics['auc_roc']:.4f}")
 
-    #     # Save Results to JSON
-    #     results_path = f"{results_folder}{os.sep}task-2_3_st1_maple_results.json"
-    #     with open(results_path, "w") as file:
-    #         json.dump({
-    #             "Top-1 Accuracy": f"{metrics['accuracy']:.4f}",
-    #             "Top-3 Accuracy": f"{metrics['top3_accuracy']:.4f}",
-    #             "F1-Score": f"{metrics['f1_score']:.4f}",
-    #             "AUC-ROC": f"{metrics['auc_roc']:.4f}"
-    #         }, file, indent=4)
+        # Save Results to JSON
+        results_path = f"{results_folder}{os.sep}task-2_3_st1_maple_results.json"
+        with open(results_path, "w") as file:
+            json.dump({
+                "Top-1 Accuracy": f"{metrics['accuracy']:.4f}",
+                "Top-3 Accuracy": f"{metrics['top3_accuracy']:.4f}",
+                "F1-Score": f"{metrics['f1_score']:.4f}",
+                "AUC-ROC": f"{metrics['auc_roc']:.4f}"
+            }, file, indent=4)
         
-    # else:
-    #     print(f"Model weights not found at '{model_weights_path}'.")
-    #     print("Please train the model first by running this script.")
+    else:
+        print(f"Model weights not found at '{model_weights_path}'.")
+        print("Please train the model first by running this script.")
