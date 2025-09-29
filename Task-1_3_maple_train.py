@@ -348,7 +348,7 @@ def train_maple():
     train_loader = DataLoader(train_dataset, batch_size=64, shuffle=True)
     history = defaultdict(list)
     
-    for epoch in range(1):
+    for epoch in range(10):
         maple_clip.train()
         epoch_loss = 0
         
